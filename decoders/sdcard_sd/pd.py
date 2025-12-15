@@ -232,7 +232,7 @@ class Decoder(srd.Decoder):
     def handle_cmd7(self):
         # CMD7 (SELECT/DESELECT_CARD) -> R1b
         self.putc('Select / deselect card')
-        self.response = self.R6
+        self.response = self.R1
 
     def handle_cmd8(self):
         # CMD8 (SEND_IF_COND) -> R7
