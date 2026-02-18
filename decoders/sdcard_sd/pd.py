@@ -308,6 +308,23 @@ class Decoder(srd.Decoder):
         # ACMD51 (SEND_SCR) -> R1
         self.putc('Read SD config register (SCR)')
         self.response = self.R1
+        
+    def handle_command(self):
+        # Handle command.
+        s = 'ACMD' if self.is_acmd else 'CMD'
+        self.cmd_str = '%s%d (%s)' % (s, self.cmd, self.cmd_name(self.cmd))
+        self.putc('%s%d' % (s, self.cmd))
+
+        # Call the respective handler method for the command.
+        a = 'a' if self.is_acmd else ''
+        cmdstr = 'handle_%scmd%d' % (a, self.cmd)
+        if hasattr(self, cmdstr):
+            handle_cmd = getattr(self, cmdstr)
+            handle_cmd()
+        
+        # Leave ACMD mode again after the first command after CMD55.
+        if self.is_acmd and self.cmd not in (55, 63):
+            self.is_acmd = False
 
     def handle_reg_status(self):
         self.putf(8, 8, [Ann.R_STATUS_OUT_OF_RANGE, ['OUT_OF_RANGE']])
@@ -499,24 +516,7 @@ class Decoder(srd.Decoder):
 
             # Is this command or response?
             if self.token[1].bit:
-                # Handle command token.
-                s = 'ACMD' if self.is_acmd else 'CMD'
-                self.cmd_str = '%s%d (%s)' % (s, self.cmd, self.cmd_name(self.cmd))
-                
-                # Call the respective handler method for the command.
-                a = 'a' if self.is_acmd else ''
-                cmdstr = 'handle_%scmd%d' % (a, self.cmd)
-                if hasattr(self, cmdstr):
-                    handle_cmd = getattr(self, cmdstr)
-                    handle_cmd()
-                else:
-                    # Unknown command.
-                    self.putc('%s%d' % (s, self.cmd))
-                    self.response = self.R1
-                
-                # Leave ACMD mode again after the first command after CMD55.
-                if self.is_acmd and self.cmd not in (55, 63):
-                    self.is_acmd = False
+                self.handle_command()
             else:
                 # Handle response token.
                 self.response.handler()
