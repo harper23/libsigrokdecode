@@ -46,7 +46,11 @@ a = ['CMD%d' % i for i in range(64)] + ['ACMD%d' % i for i in range(64)] + \
     ['R_CSD_' + r for r in reg_csd] + \
     ['BIT_' + r for r in ('0', '1')] + \
     ['F_' + f for f in token_fields] + \
-    ['DECODED_BIT', 'DECODED_F']
+    ['DECODED_BIT', 'DECODED_F'] + \
+    ['DAT%d' % i for i in range(4) ] + \
+    ['CRC%d' % i for i in range(4) ] + \
+    ['BYTE'] + \
+    ['CRC']
 Ann = SrdIntEnum.from_list('Ann', a)
 
 s = ['GET_COMMAND_TOKEN', 'HANDLE_CMD999'] + \
@@ -55,9 +59,29 @@ s = ['GET_COMMAND_TOKEN', 'HANDLE_CMD999'] + \
     ['GET_RESPONSE_R%s' % r.upper() for r in responses]
 St = SrdStrEnum.from_list('St', s)
 
+#d = ['GET_DATA_START', 'HANDLE_DATA']
+#Dst = SrdStrEnum.from_list('Dst', d)
+
 class Bit:
     def __init__(self, s, e, b):
         self.ss, self.es, self.bit = s, e ,b
+
+# Bit-wise CRC-16-CCITT Streaming
+class CRC16Bitwise:
+    def __init__(self, poly=0x1021, init_crc=0x0000):
+        self.poly = poly
+        self.crc = init_crc
+
+    def update_bit(self, bit):
+        """Add a single bit to CRC"""
+        topbit = ((self.crc >> 15) & 1) ^ (bit & 1)
+        self.crc = ((self.crc << 1) & 0xFFFF)
+        if topbit:
+            self.crc ^= self.poly
+
+    def digest(self):
+        """return current CRC value"""
+        return self.crc
 
 class Response:
     def __init__(self, type, handler):
@@ -95,19 +119,31 @@ class Decoder(srd.Decoder):
     ( \
         ('decoded-bit', 'Decoded bit'),
         ('decoded-field', 'Decoded field'),
-    )
+    ) + tuple(('dat%d' % i, 'DAT%d' % i) for i in range(4)) + \
+        tuple(('crc%d' % i, 'CRC%d' % i) for i in  range(4)) + \
+    ( \
+		('byte', 'BYTE'),
+        ('crc', 'CRC'),
+	)
+
     annotation_rows = (
         ('raw-bits', 'Raw bits', Ann.prefixes('BIT_')),
         ('decoded-bits', 'Decoded bits', (Ann.DECODED_BIT,) + Ann.prefixes('R_')),
         ('decoded-fields', 'Decoded fields', (Ann.DECODED_F,)),
         ('fields', 'Fields', Ann.prefixes('F_')),
         ('commands', 'Commands', Ann.prefixes('CMD ACMD RESPONSE_')),
+        ('data0', 'Data0', (Ann.DAT0, Ann.CRC0,)),
+        ('data1', 'Data1', (Ann.DAT1, Ann.CRC1,)),
+        ('data2', 'Data2', (Ann.DAT2, Ann.CRC2,)),
+        ('data3', 'Data3', (Ann.DAT3, Ann.CRC3,)),
+        ('bytes', 'Bytes', (Ann.BYTE, Ann.CRC,)),
     )
 
     def __init__(self):
         self.reset()
 
     def reset(self):
+        print("sdcard_sd.reset")
         self.state = St.GET_COMMAND_TOKEN
         self.token = []
         self.is_acmd = False # Indicates CMD vs. ACMD
@@ -121,6 +157,16 @@ class Decoder(srd.Decoder):
         self.R6 = Response(6, self.handle_response_r6)
         self.R7 = Response(7, self.handle_response_r7)
         self.response = self.R1
+
+        self.bus_width = 1      # default bus width
+        self.blocksize = 512    # default block size
+        self.firstbit = False   # first bit after start bit
+        self.databits = 0       # number of remaining data bits
+        self.datastart = 0      # samplenum of the current bit cycle start
+        self.databyte = 0       # accumulated data byte
+        self.bitnum = 0         # number of bits in accu
+        self.bytestart = 0      # samplenum of the byte start
+        self.get_data = self.get_data_start
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
@@ -268,6 +314,7 @@ class Decoder(srd.Decoder):
         # CMD16 (SET_BLOCKLEN) -> R1
         self.puta(0, 31, [Ann.DECODED_F, ['Block length', 'Blocklen', 'BL', 'B']])
         self.putc('Set the block length to %d bytes' % self.arg)
+        self.blocksize = self.arg
         self.response = self.R1
 
     def handle_cmd55(self):
@@ -280,7 +327,11 @@ class Decoder(srd.Decoder):
 
     def handle_acmd6(self):
         # ACMD6 (SET_BUS_WIDTH) -> R1
-        self.putc('Read SD config register (SCR)')
+        #self.putc('Read SD config register (SCR)')        
+        if self.arg == 2:
+            self.bus_width = 4
+        else:
+            self.bus_width = 1
         self.response = self.R1
 
     def handle_acmd13(self):
@@ -308,7 +359,7 @@ class Decoder(srd.Decoder):
         # ACMD51 (SEND_SCR) -> R1
         self.putc('Read SD config register (SCR)')
         self.response = self.R1
-        
+
     def handle_command(self):
         # Handle command.
         s = 'ACMD' if self.is_acmd else 'CMD'
@@ -503,23 +554,113 @@ class Decoder(srd.Decoder):
             # Wait for a rising CLK edge.
             (cmd_pin, clk, dat0, dat1, dat2, dat3) = self.wait({Pin.CLK: 'r'})
 
+            self.get_data([dat0, dat1, dat2, dat3])
+
             # Read a complete token.
             if len(self.token) == 0:
                 # Wait for start bit (CMD = 0).
                 if cmd_pin != 0:
                     continue
-            if not self.get_token_bits(cmd_pin, self.expectedBits):
-                continue
+            if self.get_token_bits(cmd_pin, self.expectedBits):
 
-            # Token is complete, make annotations for common fields.
-            self.handle_common_token_fields()
+                # Token is complete, make annotations for common fields.
+                self.handle_common_token_fields()
 
-            # Is this command or response?
-            if self.token[1].bit:
-                self.handle_command()
-            else:
-                # Handle response token.
-                self.response.handler()
-            
-            # Start with next token.
-            self.token = []
+                # Is this command or response?
+                if self.token[1].bit:
+                    self.handle_command()
+                else:
+                    # Handle response token.
+                    self.response.handler()
+
+                # Start with next token.
+                self.token = []
+
+    def get_data_start(self, data):
+        # check if start bit occurs on line DAT0
+        if data[0] == 0:
+            self.datastart = self.samplenum
+            self.get_data = self.get_data_bits
+            self.firstbit = True
+            self.databits = (8 * self.blocksize) // self.bus_width
+
+    def get_data_bits(self, data):
+        # get the next data bit(s)
+        bitlen = self.samplenum - self.datastart
+        halfbitlen = (bitlen) // 2
+        if self.firstbit:
+            self.firstbit = False
+            self.put(self.datastart - halfbitlen, self.samplenum - halfbitlen, self.out_ann, [Ann.DAT0, ['Start bit', 'Start', 'S']])
+            self.crc0 = CRC16Bitwise()
+            if self.bus_width == 4:
+                self.crc1 = CRC16Bitwise()
+                self.crc2 = CRC16Bitwise()
+                self.crc3 = CRC16Bitwise()
+            self.databyte = 0
+            self.bitnum = 0
+            self.bytestart = self.datastart
+
+        ss, es = self.datastart + halfbitlen, self.samplenum + halfbitlen
+        self.put(ss, es, self.out_ann, [Ann.DAT0, ['%d' % data[0]]])
+        self.crc0.update_bit(data[0])
+        self.databyte = self.databyte << 1 | data[0]
+        self.bitnum += 1
+
+        if self.bus_width == 4:
+            for i in range(1, 4):
+                self.put(ss, es, self.out_ann, [Ann.DAT0 + i, ['%d' % data[i]]])
+            self.crc1.update_bit(data[1])
+            self.crc2.update_bit(data[2])
+            self.crc3.update_bit(data[3])
+            self.databyte = self.databyte << 3 | (data[1] << 2) | (data[2] << 1) | data[3]
+            self.bitnum += 3
+
+        if self.bitnum == 8:
+            self.put(self.bytestart + halfbitlen, es, self.out_ann, [Ann.BYTE, ['%02x' % self.databyte]])
+            self.databyte = 0
+            self.bitnum = 0
+            self.bytestart = self.samplenum
+            if self.databits < 890:
+                pass
+
+        self.databits -= 1
+        if self.databits == 0:
+            # all data bits received, expect CRC
+            self.get_data = self.get_data_crc
+            self.linecrc0 = 0
+            self.linecrc1 = 0
+            self.linecrc2 = 0
+            self.linecrc3 = 0
+            self.databits = 16
+            self.crcstart = self.samplenum
+
+        self.datastart = self.samplenum
+
+    def get_data_crc(self, data):
+        # get the CRC on all lines 
+        bitlen = self.samplenum - self.datastart
+        halfbitlen = (bitlen) // 2
+        self.put(self.datastart + halfbitlen, self.samplenum + halfbitlen, self.out_ann, [Ann.CRC0, ['%d' % data[0]]])
+        self.linecrc0 = (self.linecrc0 << 1) | data[0]
+
+        if self.bus_width == 4:
+            self.put(self.datastart + halfbitlen, self.samplenum + halfbitlen, self.out_ann, [Ann.CRC1, ['%d' % data[1]]])
+            self.put(self.datastart + halfbitlen, self.samplenum + halfbitlen, self.out_ann, [Ann.CRC2, ['%d' % data[2]]])
+            self.put(self.datastart + halfbitlen, self.samplenum + halfbitlen, self.out_ann, [Ann.CRC3, ['%d' % data[3]]])
+            self.linecrc1 = (self.linecrc1 << 1) | data[1]
+            self.linecrc2 = (self.linecrc2 << 1) | data[2]
+            self.linecrc3 = (self.linecrc3 << 1) | data[3]
+
+        self.databits -= 1
+        if self.databits == 0:
+            self.put(self.crcstart + halfbitlen, self.samplenum + halfbitlen, self.out_ann,
+                     [Ann.CRC, ['crc']])
+            self.get_data = self.get_data_stop 
+
+        self.datastart = self.samplenum
+
+    def get_data_stop(self, data):
+       # get the stop bit
+       halfbitlen = (self.samplenum - self.datastart)//2
+       self.put(self.datastart + halfbitlen, self.samplenum + halfbitlen, self.out_ann, [Ann.DAT0, ['Stop bit', 'Stop', 'T']])
+       self.get_data = self.get_data_start
