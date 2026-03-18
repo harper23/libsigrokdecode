@@ -59,9 +59,6 @@ s = ['GET_COMMAND_TOKEN', 'HANDLE_CMD999'] + \
     ['GET_RESPONSE_R%s' % r.upper() for r in responses]
 St = SrdStrEnum.from_list('St', s)
 
-#d = ['GET_DATA_START', 'HANDLE_DATA']
-#Dst = SrdStrEnum.from_list('Dst', d)
-
 class Bit:
     def __init__(self, s, e, b):
         self.ss, self.es, self.bit = s, e ,b
@@ -97,6 +94,10 @@ class Decoder(srd.Decoder):
     inputs = ['logic']
     outputs = []
     tags = ['Memory']
+    options = (
+        {'id': 'bus_width', 'desc': 'default bus width', 'default': 1, 'values': (1,4,8)},
+        {'id': 'block_len', 'desc': 'default block size', 'default': 512 },
+    )
     channels = (
         {'id': 'cmd',  'name': 'CMD',  'desc': 'Command'},
         {'id': 'clk',  'name': 'CLK',  'desc': 'Clock'},
@@ -122,9 +123,9 @@ class Decoder(srd.Decoder):
     ) + tuple(('dat%d' % i, 'DAT%d' % i) for i in range(4)) + \
         tuple(('crc%d' % i, 'CRC%d' % i) for i in  range(4)) + \
     ( \
-		('byte', 'BYTE'),
+        ('byte', 'BYTE'),
         ('crc', 'CRC'),
-	)
+    )
 
     annotation_rows = (
         ('raw-bits', 'Raw bits', Ann.prefixes('BIT_')),
@@ -143,7 +144,6 @@ class Decoder(srd.Decoder):
         self.reset()
 
     def reset(self):
-        print("sdcard_sd.reset")
         self.state = St.GET_COMMAND_TOKEN
         self.token = []
         self.is_acmd = False # Indicates CMD vs. ACMD
@@ -169,6 +169,8 @@ class Decoder(srd.Decoder):
         self.get_data = self.get_data_start
 
     def start(self):
+        self.bus_width = self.options['bus_width']
+        self.block_len = self.options['block_len']
         self.out_ann = self.register(srd.OUTPUT_ANN)
 
     def putt(self, data):
